@@ -1,0 +1,7 @@
+[package]
+name = "hello"
+version = "0.1.0"
+authors = ["Jeff Kent <jeff@jkent.net>"]
+
+[dependencies]
+percent-encoding = "1"
