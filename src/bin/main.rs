@@ -1,16 +1,18 @@
-extern crate hello;
+extern crate httpd;
 extern crate percent_encoding;
 
-use hello::ThreadPool;
+use httpd::ThreadPool;
 use percent_encoding as pe;
 use std::borrow::Borrow;
 use std::error::Error;
-use std::fs::{File, metadata};
+use std::fs;
 use std::io::{BufReader, BufWriter};
 use std::io::prelude::*;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+
+const GENERATE_INDEXES: bool = true;
 
 fn main() {
 	let listener = TcpListener::bind("[::]:8080").unwrap();
@@ -23,7 +25,7 @@ fn main() {
 		pool.execute(move || {
 			if let Err(_) = handle_connection(&stream) {
 				let mut writer = BufWriter::new(&stream);
-				abort(&mut writer, 500); // ignored
+				abort(&mut writer, 500); // result ignored
 			}
 		});
 	}
@@ -64,39 +66,47 @@ fn handle_connection(stream: &TcpStream) -> Result<(), Box<Error + Send + Sync>>
 	let mut http_path = String::new();
 	http_path.push_str(&path);
 
-	let mut path = path;
-	path.insert_str(0, ".");
-	let path = Path::new(&path);
+	let mut fs_path = path;
+	fs_path.insert_str(0, ".");
+	let fs_path = Path::new(&fs_path);
 
-	if !path.exists() {
+	if !fs_path.exists() {
 		abort(&mut writer, 404)?;
 		return Ok(());
 	}
 
-	let mut path = PathBuf::from(&path);
+	let mut fs_path = PathBuf::from(&fs_path).canonicalize()?;
 
-	let md = metadata(&path)?;
+	let md = fs::metadata(&fs_path)?;
 	if md.is_dir() {
 		if !http_path.ends_with('/') {
 			http_path.push('/');
 			redirect(&mut writer, 301, PathBuf::from(http_path))?;
-		}
-
-		path.push("index.html");	
-		if !path.exists() {
-			/* TODO: Generate index */
-			abort(&mut writer, 404)?;
 			return Ok(());
 		}
+
+		let mut index_path = fs_path.clone();
+		index_path.push("index.html");
+
+		if !index_path.exists() {
+			if GENERATE_INDEXES {
+				write_index(&mut writer, &fs_path, &http_path)?;
+			} else {
+				abort(&mut writer, 404)?;
+			}
+			return Ok(());
+		}
+
+		fs_path = index_path;
 	}
 
-	let mut file = File::open(&path)?;
-	let mut contents = String::new();
-	file.read_to_string(&mut contents)?;
-	let response = format!("HTTP/1.1 200 OK\r\n\r\n{}", contents);
-
-	writer.write(response.as_bytes())?;
-	writer.flush()?;
+	let mut file = fs::File::open(&fs_path)?;
+	let mut content = String::new();
+	let mut headers: Vec<(&str, &str)> = vec![];
+	let content_type = guess_content_type(&fs_path);
+	headers.push(("Content-Type", &content_type));
+	file.read_to_string(&mut content)?;
+	write_content(&mut writer, headers, &content)?;
 	Ok(())
 }
 
@@ -138,7 +148,7 @@ fn redirect(writer: &mut BufWriter<&TcpStream>, code: u32, path: PathBuf) -> Res
 	Ok(())
 }
 
-fn abort(writer: &mut BufWriter<&TcpStream>, code: u32) -> Result<(), Box<Error + Send + Sync>> {
+fn abort(mut writer: &mut BufWriter<&TcpStream>, code: u32) -> Result<(), Box<Error + Send + Sync>> {
 	let reason = match code {
 		404 => "Not Found",
 		405 => "Method Not Allowed",
@@ -146,16 +156,78 @@ fn abort(writer: &mut BufWriter<&TcpStream>, code: u32) -> Result<(), Box<Error 
 		500 | _ => "Internal Server Error",
 	};
 	
-	let mut body = String::new();
+	let mut content = String::new();
+	let mut headers: Vec<(&str, &str)> = vec![];
 	let filename = format!("{}.html", code);
-	if let Ok(mut file) = File::open(filename) {
-		file.read_to_string(&mut body)?;
+	if let Ok(mut file) = fs::File::open(filename) {
+		headers.push(("Content-Type", "text/html"));
+		file.read_to_string(&mut content)?;
 	} else {
-		body.push_str(reason);
+		headers.push(("Content-Type", "text/plain"));
+		content.push_str(reason);
+	}
+	write_content(&mut writer, headers, &content)?;
+	Ok(())
+}
+
+fn write_index(mut writer: &mut BufWriter<&TcpStream>, fs_path: &Path, http_path: &str) -> Result<(), Box<Error + Send + Sync>> {
+	let mut content = String::new();
+	let headers: Vec<(&str, &str)> = vec![("Content-Type", "text/html")];
+	content.push_str(&format!("<html><head><title>Index of {}</title></head><body><h1>Index of {}</h1>", http_path, http_path));
+
+	if http_path != "/" {
+		content.push_str(&format!("<a href=\"{}../\">../</a><br/>", http_path));
 	}
 
-	let response = format!("HTTP/1.1 {} {}\r\n\r\n{}", code, reason, body);
-	writer.write(response.as_bytes())?;
+	let mut paths: Vec<_> = fs::read_dir(fs_path)
+		.unwrap().map(|r| r.unwrap()).collect();
+	paths.sort_by_key(|dir| (!dir.path().is_dir(), dir.path()));
+	for entry in paths {
+		let path = entry.path();
+		let name = path.strip_prefix(fs_path)?;
+		if path.is_dir() {
+			content.push_str(&format!("<a href=\"{}{}/\">{}/</a><br/>", http_path, name.display(), name.display()));
+		} else {
+			content.push_str(&format!("<a href=\"{}{}\">{}</a><br/>", http_path, name.display(), name.display()));
+		}
+	}
+
+	content.push_str("<body></html>");
+	write_content(&mut writer, headers, &content)?;
+	Ok(())
+}
+
+fn write_content(writer: &mut BufWriter<&TcpStream>, headers: Vec<(&str, &str)>, content: &str) -> Result<(), Box<Error + Send + Sync>> {
+	writer.write("HTTP/1.1 200 OK\r\n".as_bytes())?;
+	for (name, value) in headers {
+		writer.write(format!("{}: {}\r\n", name, value).as_bytes())?;
+	}
+	writer.write("\r\n".as_bytes())?;
+	writer.write(content.as_bytes())?;
 	writer.flush()?;
 	Ok(())
+}
+
+fn guess_content_type(path: &PathBuf) -> &str {
+	let extension = match path.extension() {
+		Some(extension) => String::from(extension.to_string_lossy()),
+		None => String::new(),
+	};
+
+	match extension.as_ref() {
+		"css" => "text/css",
+		"gif" => "image/gif",
+		"html" => "text/html",
+		"ico" => "image/x-icon",
+		"jpg" | "jpeg" => "image/jpeg",
+		"js" => "application/javascript",
+		"png" => "image/png",
+		"svg" => "image/svg+xml",
+		"ttf" => "font/ttf",
+		"txt" => "text/plain",
+		"woff" => "font/woff",
+		"woff2" => "font/woff2",
+		"xml" => "application/xml",
+		_ => "application/octet-stream",
+	}
 }
