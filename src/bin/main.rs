@@ -6,8 +6,9 @@ use percent_encoding as pe;
 use std::borrow::Borrow;
 use std::error::Error;
 use std::fs;
-use std::io::{BufReader, BufWriter};
+use std::fs::File;
 use std::io::prelude::*;
+use std::io::{BufReader, BufWriter};
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -90,7 +91,7 @@ fn handle_connection(stream: &TcpStream) -> Result<(), Box<Error + Send + Sync>>
 
 		if !index_path.exists() {
 			if GENERATE_INDEXES {
-				write_index(&mut writer, &fs_path, &http_path)?;
+				send_index(&mut writer, &fs_path, &http_path)?;
 			} else {
 				abort(&mut writer, 404)?;
 			}
@@ -100,13 +101,11 @@ fn handle_connection(stream: &TcpStream) -> Result<(), Box<Error + Send + Sync>>
 		fs_path = index_path;
 	}
 
-	let mut file = fs::File::open(&fs_path)?;
-	let mut content = String::new();
-	let mut headers: Vec<(&str, &str)> = vec![];
-	let content_type = guess_content_type(&fs_path);
-	headers.push(("Content-Type", &content_type));
-	file.read_to_string(&mut content)?;
-	write_content(&mut writer, headers, &content)?;
+	let headers: Vec<(&str, &str)> = vec![("Content-Type", guess_content_type(&fs_path))];
+
+	send_response(&mut writer, 200)?;
+	send_headers(&mut writer, headers)?;
+	send_file(&mut writer, &fs_path)?;
 	Ok(())
 }
 
@@ -132,33 +131,64 @@ fn parse_request(request: &str) -> Result<(&str, String, String, &str), Box<Erro
 	Ok((method, path, args, version))
 }
 
-fn redirect(writer: &mut BufWriter<&TcpStream>, code: u32, path: PathBuf) -> Result<(), Box<Error + Send + Sync>> {
-	let reason = match code {
+fn send_file(writer: &mut BufWriter<&TcpStream>, fs_path: &Path) -> Result<(), Box<Error + Send + Sync>> {
+	let file = File::open(&fs_path)?;
+	let mut file_reader = BufReader::with_capacity(32768, file);
+	loop {
+		let length = {
+			let buf = file_reader.fill_buf()?;
+			writer.write(buf)?;
+			buf.len()
+		};
+		if length == 0 {
+			break;
+		}
+		file_reader.consume(length);
+	}
+	Ok(())
+}
+
+fn send_response(writer: &mut BufWriter<&TcpStream>, code: u32) -> Result<&'static str, Box<Error + Send + Sync>> {
+    let reason = match code {
+		200 => "OK",
 		301 => "Moved Permanently",
 		302 => "Found",
 		303 => "See Other",
 		305 => "Use Proxy",
-		307 | _ => "Temporary Redirect",
+		307 => "Temporary Redirect",
+		404 => "Not Found",
+		405 => "Method Not Allowed",
+		505 => "HTTP Version Not Supported",
+		500 | _ => "Internal Server Error",	
 	};
 
-	let response = format!("HTTP/1.1 {} {}\r\nLocation: {}\r\n\r\n", 
-			code, reason, path.to_string_lossy());
+	let response = format!("HTTP/1.1 {} {}\r\n", code, reason); 
 	writer.write(response.as_bytes())?;
+	Ok(reason)
+}
+
+fn send_headers(writer: &mut BufWriter<&TcpStream>, headers: Vec<(&str, &str)>) -> Result<(), Box<Error + Send + Sync>> {
+	for (name, value) in headers {
+		writer.write(format!("{}: {}\r\n", name, value).as_bytes())?;
+	};
+	writer.write(b"\r\n")?;
 	writer.flush()?;
 	Ok(())
 }
 
+fn redirect(mut writer: &mut BufWriter<&TcpStream>, code: u32, path: PathBuf) -> Result<(), Box<Error + Send + Sync>> {
+	let location = path.to_string_lossy();
+	let headers: Vec<(&str, &str)> = vec![("Location", &location)];
+	send_response(&mut writer, code)?;
+	send_headers(&mut writer, headers)?;
+	Ok(())
+}
+
 fn abort(mut writer: &mut BufWriter<&TcpStream>, code: u32) -> Result<(), Box<Error + Send + Sync>> {
-	let reason = match code {
-		404 => "Not Found",
-		405 => "Method Not Allowed",
-		505 => "HTTP Version Not Supported",
-		500 | _ => "Internal Server Error",
-	};
-	
 	let mut content = String::new();
 	let mut headers: Vec<(&str, &str)> = vec![];
 	let filename = format!("{}.html", code);
+	let reason = send_response(&mut writer, code)?;
 	if let Ok(mut file) = fs::File::open(filename) {
 		headers.push(("Content-Type", "text/html"));
 		file.read_to_string(&mut content)?;
@@ -166,11 +196,12 @@ fn abort(mut writer: &mut BufWriter<&TcpStream>, code: u32) -> Result<(), Box<Er
 		headers.push(("Content-Type", "text/plain"));
 		content.push_str(reason);
 	}
-	write_content(&mut writer, headers, &content)?;
+	send_headers(&mut writer, headers)?;
+	send_content(&mut writer, &content)?;
 	Ok(())
 }
 
-fn write_index(mut writer: &mut BufWriter<&TcpStream>, fs_path: &Path, http_path: &str) -> Result<(), Box<Error + Send + Sync>> {
+fn send_index(mut writer: &mut BufWriter<&TcpStream>, fs_path: &Path, http_path: &str) -> Result<(), Box<Error + Send + Sync>> {
 	let mut content = String::new();
 	let headers: Vec<(&str, &str)> = vec![("Content-Type", "text/html")];
 	content.push_str(&format!("<html><head><title>Index of {}</title></head><body><h1>Index of {}</h1>", http_path, http_path));
@@ -193,16 +224,13 @@ fn write_index(mut writer: &mut BufWriter<&TcpStream>, fs_path: &Path, http_path
 	}
 
 	content.push_str("<body></html>");
-	write_content(&mut writer, headers, &content)?;
+	send_response(&mut writer, 200)?;
+	send_headers(&mut writer, headers)?;
+	send_content(&mut writer, &content)?;
 	Ok(())
 }
 
-fn write_content(writer: &mut BufWriter<&TcpStream>, headers: Vec<(&str, &str)>, content: &str) -> Result<(), Box<Error + Send + Sync>> {
-	writer.write("HTTP/1.1 200 OK\r\n".as_bytes())?;
-	for (name, value) in headers {
-		writer.write(format!("{}: {}\r\n", name, value).as_bytes())?;
-	}
-	writer.write("\r\n".as_bytes())?;
+fn send_content(writer: &mut BufWriter<&TcpStream>, content: &str) -> Result<(), Box<Error + Send + Sync>> {
 	writer.write(content.as_bytes())?;
 	writer.flush()?;
 	Ok(())
